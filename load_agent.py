@@ -1,5 +1,7 @@
-# Place your imports below
-
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import VecFrameStack, VecNormalize, DummyVecEnv
+import gymnasium as gym
+import os
 
 def load_best_agent():
     """
@@ -39,4 +41,15 @@ def load_best_agent():
         >>> observation = get_current_observation()  # Your method to fetch the current observation.
         >>> action = model(observation)
     """
-    pass  # Replace this with your implementation
+    # Specify path to the model
+    model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+    model_path = os.path.join(model_dir, "ppo_car_racing_best")
+    
+    # Check if model exists
+    if not os.path.exists(f"{model_path}.zip"):
+        raise FileNotFoundError(f"Model file not found at {model_path}.zip. Please train the model first.")
+    
+    # Load the trained model
+    model = PPO.load(model_path)
+    
+    return model
