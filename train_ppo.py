@@ -57,7 +57,7 @@ eval_callback = EvalCallback(
 # Train the model
 print("Starting training...")
 model.learn(
-    total_timesteps=500000,
+    total_timesteps=1000000,
     callback=eval_callback,
     progress_bar=True
 )
