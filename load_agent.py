@@ -1,7 +1,10 @@
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import VecFrameStack, VecNormalize, DummyVecEnv
-import gymnasium as gym
 import os
+import torch
+import gymnasium as gym
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecTransposeImage
+
+from a2c import A2C
 
 def load_best_agent():
     """
@@ -41,15 +44,28 @@ def load_best_agent():
         >>> observation = get_current_observation()  # Your method to fetch the current observation.
         >>> action = model(observation)
     """
-    # Specify path to the model
     model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
-    model_path = os.path.join(model_dir, "ppo_car_racing_best")
     
-    # Check if model exists
-    if not os.path.exists(f"{model_path}.zip"):
-        raise FileNotFoundError(f"Model file not found at {model_path}.zip. Please train the model first.")
+    if algorithm.lower() == "ppo":
+        model_path = os.path.join(model_dir, "ppo_car_racing_best")
+        if not os.path.exists(f"{model_path}.zip"):
+            raise FileNotFoundError(f"PPO model not found at {model_path}.zip")
+        return PPO.load(model_path)
+        
+    elif algorithm.lower() == "a2c":
+        model_path = os.path.join(model_dir, "a2c_car_racing_best.pt")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"A2C model not found at {model_path}")
+        
+        # Create environment to initialize the agent
+        env = DummyVecEnv([lambda: gym.make("CarRacing-v3", continuous=True)])
+        env = VecFrameStack(env, n_stack=4)
+        env = VecTransposeImage(env)
+        
+        # Initialize and load the A2C agent
+        agent = A2C(env=env)
+        agent.load(model_path)
+        return agent
     
-    # Load the trained model
-    model = PPO.load(model_path)
-    
-    return model
+    else:
+        raise ValueError("Algorithm must be either 'ppo' or 'a2c'")

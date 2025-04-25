@@ -2,3 +2,5 @@ slurm/
 logs/
 *.err
 *.out
+
+models/a2c_car_racing_step*

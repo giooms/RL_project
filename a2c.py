@@ -178,10 +178,9 @@ class A2C:
         print("Starting A2C training...")
         while step_count < num_steps:
             # Storage for the current update cycle
-            values = []
-            log_probs = []
+            collected_obs = []
+            collected_actions = []
             rewards = []
-            entropies = []
             masks = []  # For tracking episode endings
             
             # Collect experience for one update
@@ -189,28 +188,44 @@ class A2C:
                 obs_tensor = self._preprocess_obs(obs)
                 
                 with torch.no_grad():
-                    action, value, log_prob, dist = self.model.get_action_and_value(obs_tensor)
-                    entropy = dist.entropy().mean()
+                    action, _, _, dist = self.model.get_action_and_value(obs_tensor)
                 
                 # Execute action in environment
                 action_np = action.cpu().numpy()  # Get numpy array
                 if len(action_np.shape) == 2 and action_np.shape[0] == 1:
                     # If this is a batch with size 1, we're passing this through a vectorized environment
                     # The vectorized env will handle the [0] indexing
-                    next_obs, reward, terminated, truncated, _ = self.env.step(action_np)
+                    step_result = self.env.step(action_np)
+                    if len(step_result) == 5:
+                        next_obs, reward, terminated, truncated, _ = step_result
+                    else:
+                        # Handle the case when the environment returns 4 values (older format)
+                        next_obs, reward, done, _ = step_result
+                        terminated = done
+                        truncated = False
                 else:
                     # If not a batch with proper shape, reshape it to have proper format for vectorized env
                     action_reshaped = action_np.reshape(1, -1)  # Reshape to [1, action_dim]
-                    next_obs, reward, terminated, truncated, _ = self.env.step(action_reshaped)
+                    step_result = self.env.step(action_reshaped)
+                    if len(step_result) == 5:
+                        next_obs, reward, terminated, truncated, _ = step_result
+                    else:
+                        # Handle the case when the environment returns 4 values (older format)
+                        next_obs, reward, done, _ = step_result
+                        terminated = done
+                        truncated = False
                 
                 done = terminated or truncated
                 
                 # Store transition
-                values.append(value)
-                log_probs.append(log_prob)
-                rewards.append(torch.tensor([reward]).to(self.device))
-                entropies.append(entropy)
-                masks.append(torch.tensor([1.0 - float(done)]).to(self.device))
+                if isinstance(reward, np.ndarray):
+                    reward_value = reward.item() if reward.size == 1 else reward.flatten()[0]
+                else:
+                    reward_value = reward
+                rewards.append(torch.tensor([reward_value]).to(self.device))
+                collected_obs.append(obs)
+                collected_actions.append(action)
+                masks.append(torch.tensor([1.0 - float(bool(done))]).to(self.device))
                 
                 # Update episode statistics
                 episode_reward += reward
@@ -219,7 +234,17 @@ class A2C:
                 
                 # Handle episode end
                 if done:
-                    print(f"Episode {episode_count+1} finished: Reward={episode_reward:.2f}, Length={episode_length}")
+                    if isinstance(episode_reward, np.ndarray):
+                        episode_reward_value = episode_reward.item() if episode_reward.size == 1 else episode_reward.flatten()[0]
+                    else:
+                        episode_reward_value = episode_reward
+
+                    if isinstance(episode_length, np.ndarray):
+                        episode_length_value = episode_length.item() if episode_length.size == 1 else episode_length.flatten()[0]
+                    else:
+                        episode_length_value = episode_length
+
+                    print(f"Episode {episode_count+1} finished: Reward={episode_reward_value:.2f}, Length={episode_length_value}")
                     episode_rewards.append(episode_reward)
                     episode_lengths.append(episode_length)
                     
@@ -236,6 +261,22 @@ class A2C:
                     break
             
             # Calculate returns and advantages
+            values = []
+            log_probs = []
+            entropies = []
+
+            # Recompute with gradient tracking for all collected observations
+            for i in range(len(collected_obs)):
+                obs_tensor = self._preprocess_obs(collected_obs[i])
+                _, value, _, dist = self.model.get_action_and_value(obs_tensor)
+                action = collected_actions[i]
+                log_prob = dist.log_prob(action).sum(dim=-1)
+                entropy = dist.entropy().mean()
+                
+                values.append(value)
+                log_probs.append(log_prob)
+                entropies.append(entropy)
+            
             values = torch.cat(values)
             log_probs = torch.cat(log_probs)
             rewards = torch.cat(rewards)
@@ -268,7 +309,8 @@ class A2C:
             
             # Calculate losses
             policy_loss = -(log_probs * advantages.detach()).mean()
-            value_loss = F.mse_loss(values, returns)
+            # Ensure both have the same shape for MSE loss
+            value_loss = F.mse_loss(values, returns.flatten())
             entropy_loss = -entropies.mean()  # Maximize entropy (exploration)
             
             # Total loss
@@ -304,7 +346,7 @@ class A2C:
                     print(f"New best model saved with mean reward: {best_mean_reward:.2f}")
                 
                 # Also save periodic checkpoints
-                self.save(os.path.join(save_path, f"a2c_car_racing_step_{step_count}"))
+                # self.save(os.path.join(save_path, f"a2c_car_racing_step_{step_count}"))
         
         # Save final model
         self.save(os.path.join(save_path, "a2c_car_racing_final"))
@@ -327,10 +369,22 @@ class A2C:
                 
                 action_np = action.cpu().numpy()
                 if len(action_np.shape) == 2 and action_np.shape[0] == 1:
-                    obs, reward, terminated, truncated, _ = self.env.step(action_np)
+                    step_result = self.env.step(action_np)
+                    if len(step_result) == 5:
+                        obs, reward, terminated, truncated, _ = step_result
+                    else:
+                        obs, reward, done, _ = step_result
+                        terminated = done
+                        truncated = False
                 else:
                     action_reshaped = action_np.reshape(1, -1)  # Reshape to [1, action_dim]
-                    obs, reward, terminated, truncated, _ = self.env.step(action_reshaped)
+                    step_result = self.env.step(action_reshaped)
+                    if len(step_result) == 5:
+                        obs, reward, terminated, truncated, _ = step_result
+                    else:
+                        obs, reward, done, _ = step_result
+                        terminated = done
+                        truncated = False
                 done = terminated or truncated
                 episode_reward += reward
             
