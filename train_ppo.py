@@ -96,7 +96,7 @@ torch_save_callback = SaveTorchModelCallback(save_path="./models")
 # Train the model with both callbacks
 print("Starting training...")
 model.learn(
-    total_timesteps=1000000,
+    total_timesteps=1500000,
     callback=[eval_callback, torch_save_callback],
     progress_bar=True
 )

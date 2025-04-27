@@ -22,33 +22,42 @@ class CNN_Extractor(nn.Module):
     """
     def __init__(self, observation_space):
         super().__init__()
-        # Determine the number of input channels
-        # With frame stacking of 4 and RGB images (3 channels each), we have 12 input channels
-        n_input_channels = 12  # 4 stacked frames * 3 channels (RGB)
+        n_input_channels = 12
         
-        self.cnn = nn.Sequential(
-            nn.Conv2d(n_input_channels, 32, kernel_size=8, stride=4),
+        # Initial convolution
+        self.conv1 = nn.Conv2d(n_input_channels, 32, kernel_size=8, stride=4)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
+        
+        # Add residual connections
+        self.res1 = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.ReLU(),
-            nn.Flatten()
+            nn.Conv2d(64, 64, kernel_size=3, padding=1)
         )
         
-        # Calculate the output shape after CNN layers
+        self.flatten = nn.Flatten()
+        
+        # Calculate output dimension
         with torch.no_grad():
-            # Create a sample with the expected shape for the CNN
             sample_input = torch.zeros(1, n_input_channels, 96, 96)
-            sample_output = self.cnn(sample_input)
-            self.feature_dim = sample_output.shape[1]
+            x = F.relu(self.conv1(sample_input))
+            x = F.relu(self.conv2(x))
+            x = F.relu(self.conv3(x))
+            x = x + self.res1(x)  # Residual connection
+            x = self.flatten(x)
+            self.feature_dim = x.shape[1]
     
     def forward(self, x):
-        # Convert from (N, H, W, C) to (N, C, H, W) if needed
         if x.shape[-1] == 12 and len(x.shape) == 4:
             x = x.permute(0, 3, 1, 2)
         
-        return self.cnn(x / 255.0)  # Normalize pixel values
+        x = x / 255.0
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = x + self.res1(x)  # Residual connection
+        return self.flatten(x)
 
 class ActorCriticModel(nn.Module):
     """
@@ -290,12 +299,7 @@ class A2C:
                 with torch.no_grad():
                     last_value = self.model.get_action_and_value(self._preprocess_obs(obs))[1]
             
-            returns = []
-            R = last_value
-            for step in reversed(range(len(rewards))):
-                R = rewards[step] + self.gamma * R * masks[step]
-                returns.insert(0, R)
-            returns = torch.cat(returns)
+            returns = self.compute_returns(rewards, masks, last_value, n_steps=5)
             
             # Normalize returns for stability (optional)
             returns = (returns - returns.mean()) / (returns.std() + 1e-8)
@@ -417,6 +421,168 @@ class A2C:
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         return self
+    
+    # Modify the advantage calculation in A2C class
+    def compute_returns(self, rewards, masks, next_value, n_steps=5):
+        """Compute returns with n-step bootstrapping"""
+        returns = torch.zeros_like(rewards)
+        future_return = next_value
+        
+        # Standard GAE computation
+        for t in reversed(range(len(rewards))):
+            if t + n_steps < len(rewards):
+                # Use n-step return
+                n_step_return = 0
+                for i in range(n_steps):
+                    n_step_return += (self.gamma**i) * rewards[t+i]
+                n_step_return += (self.gamma**n_steps) * future_return
+                returns[t] = n_step_return
+            else:
+                # For the last steps, use standard 1-step return
+                returns[t] = rewards[t] + self.gamma * future_return * masks[t]
+            
+            future_return = returns[t]
+        
+        return returns
+
+# Add a wrapper to reshape rewards
+class RewardShapingWrapper(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.prev_pos = None
+        self.prev_velocity = None
+        
+    def reset(self, **kwargs):
+        self.prev_pos = None
+        self.prev_velocity = None
+        return self.env.reset(**kwargs)
+        
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        
+        # Extract car state
+        if hasattr(self.env.unwrapped, 'car'):
+            pos = self.env.unwrapped.car.hull.position
+            velocity = self.env.unwrapped.car.hull.linearVelocity
+            
+            # Reward for velocity in the right direction
+            speed_reward = 0
+            if self.prev_pos is not None and self.prev_velocity is not None:
+                # Calculate progress on track
+                speed = np.sqrt(velocity[0]**2 + velocity[1]**2)
+                speed_reward = min(speed * 0.1, 1.0)  # Cap the speed reward
+                
+                # Penalize going off-track
+                grass_penalty = 0
+                if hasattr(obs, 'shape') and obs.shape[-1] >= 3:
+                    # Check green channel for grass
+                    green_intensity = np.mean(obs[..., 1])
+                    if green_intensity > 150:
+                        grass_penalty = -0.2
+                
+                shaped_reward = reward + speed_reward + grass_penalty
+            else:
+                shaped_reward = reward
+            
+            self.prev_pos = pos
+            self.prev_velocity = velocity
+            return obs, shaped_reward, terminated, truncated, info
+        
+        return obs, reward, terminated, truncated, info
+
+# Add observation normalization
+class RunningMeanStd:
+    def __init__(self, shape=(), epsilon=1e-4):
+        self.mean = np.zeros(shape, dtype=np.float64)
+        self.var = np.ones(shape, dtype=np.float64)
+        self.count = epsilon
+    
+    def update(self, x):
+        # Reshape x to match the shape of self.mean if needed
+        if isinstance(x, np.ndarray) and x.shape != self.mean.shape:
+            if self.mean.size == x.size:  # They have the same number of elements
+                # If this is our first serious update, update the shape based on the input
+                if np.all(self.mean == 0) and np.all(self.var == 1) and self.count <= 1:
+                    # Reset with the proper shape
+                    orig_shape = x.shape
+                    if len(x.shape) > 1 and x.shape[0] == 1:
+                        # If x has a batch dimension of 1, remove it
+                        orig_shape = x.shape[1:]
+                    self.mean = np.zeros(orig_shape, dtype=np.float64)
+                    self.var = np.ones(orig_shape, dtype=np.float64)
+                else:
+                    # Otherwise, reshape x to match current stats shape
+                    x = x.reshape(self.mean.shape)
+        
+        # Compute batch statistics
+        batch_mean = np.mean(x, axis=0) if x.shape[0] > 1 else x[0]
+        batch_var = np.var(x, axis=0) if x.shape[0] > 1 else np.zeros_like(x[0])
+        batch_count = x.shape[0]
+        
+        # Update running statistics
+        delta = batch_mean - self.mean
+        total_count = self.count + batch_count
+        
+        # Update mean and variance using Welford's algorithm
+        new_mean = self.mean + delta * batch_count / total_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + np.square(delta) * self.count * batch_count / total_count
+        new_var = M2 / total_count
+        
+        self.mean = new_mean
+        self.var = new_var
+        self.count = total_count
+
+class NormalizeObservation(gym.Wrapper):
+    def __init__(self, env, epsilon=1e-8):
+        super().__init__(env)
+        self.epsilon = epsilon
+        # We'll initialize the running stats after we see the first observation
+        self.obs_rms = None
+        # Whether we've already initialized the running stats
+        self.initialized = False
+        
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        normalized_obs = self._normalize_observation(obs)
+        return normalized_obs, reward, terminated, truncated, info
+    
+    def reset(self, **kwargs):
+        obs = self.env.reset(**kwargs)
+        return self._normalize_observation(obs)
+    
+    def _normalize_observation(self, obs):
+        # Handle tuple observations (from SB3 reset)
+        if isinstance(obs, tuple) and len(obs) == 2:
+            obs_array = obs[0]
+            info = obs[1]
+        else:
+            obs_array = obs
+            info = None
+
+        # Skip normalization for non-numpy arrays
+        if not isinstance(obs_array, np.ndarray):
+            return obs
+
+        # Initialize running statistics if this is the first observation
+        if self.obs_rms is None:
+            self.obs_rms = RunningMeanStd(shape=obs_array.shape)
+            # Make a copy to avoid modifying the original
+            obs_for_stats = obs_array.copy().reshape(1, *obs_array.shape)
+            self.obs_rms.update(obs_for_stats)
+            
+        # Update statistics with the current observation
+        obs_for_stats = obs_array.copy().reshape(1, *obs_array.shape)
+        self.obs_rms.update(obs_for_stats)
+            
+        # Normalize the observation
+        normalized_obs = (obs_array - self.obs_rms.mean) / np.sqrt(self.obs_rms.var + self.epsilon)
+        
+        # Return in the same format as received
+        if isinstance(obs, tuple):
+            return (normalized_obs, info)
+        return normalized_obs
 
 # Training script at the bottom for when the file is run directly
 if __name__ == "__main__":
@@ -428,10 +594,12 @@ if __name__ == "__main__":
     os.makedirs("logs", exist_ok=True)
     
     def make_env():
-        """Create and wrap the CarRacing environment"""
+        """Create and wrap the CarRacing environment with improvements"""
         def _init():
             env = gym.make("CarRacing-v3", continuous=True)
-            env = Monitor(env, "logs/car_racing_a2c")
+            env = Monitor(env, "logs/car_racing_a2c_improved")
+            env = RewardShapingWrapper(env)
+            env = NormalizeObservation(env)
             return env
         return _init
     
@@ -443,18 +611,18 @@ if __name__ == "__main__":
     # Create the A2C agent
     agent = A2C(
         env=env,
-        lr=3e-4,
+        lr=1e-4,  # Lower learning rate for more stability
         gamma=0.99,
         value_coef=0.5,
-        entropy_coef=0.01,
+        entropy_coef=0.05,  # Higher entropy coefficient for better exploration
         max_grad_norm=0.5,
         device="auto"
     )
     
     # Train the agent
     agent.train(
-        num_steps=1000000,
-        update_freq=2048,
+        num_steps=2000000,  # Double the training steps
+        update_freq=128,    # More frequent updates
         eval_freq=10000,
         save_path="models"
     )
