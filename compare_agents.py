@@ -54,7 +54,9 @@ def compare_algorithms(n_episodes=20, render=False, save_video=True, output_dir=
                 # Need to wrap in DummyVecEnv and other wrappers for both algorithms
                 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecTransposeImage
                 env.close()  # Close the unwrapped env
-                env = DummyVecEnv([lambda: gym.make("CarRacing-v3", render_mode="rgb_array" if save_video else render_mode, continuous=True)])
+                env = DummyVecEnv([lambda: gym.make("CarRacing-v3", 
+                                                    render_mode="rgb_array" if save_video else render_mode, 
+                                                    continuous=True)])
                 env = VecFrameStack(env, n_stack=4)
                 env = VecTransposeImage(env)
             

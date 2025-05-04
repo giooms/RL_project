@@ -14,6 +14,7 @@ os.makedirs("logs", exist_ok=True)
 class SaveTorchModelCallback(BaseCallback):
     """
     Callback for saving the policy network as a PyTorch model (.pt)
+    and also ensuring we save the model in Stable Baselines3 .zip format.
     """
     def __init__(self, save_path, verbose=1):
         super().__init__(verbose)
@@ -35,35 +36,49 @@ class SaveTorchModelCallback(BaseCallback):
         if self.verbose > 0:
             print(f"Saved PyTorch model to {self.save_path}/ppo_car_racing_final.pt")
         
-        # Also save the best model in PyTorch format
+        # Save the final model in SB3 format too
+        self.model.save(f"{self.save_path}/ppo_car_racing_final")
+        if self.verbose > 0:
+            print(f"Saved SB3 final model to {self.save_path}/ppo_car_racing_final.zip")
+        
+        # Also save the best model in PyTorch format and copy the best SB3 model
         if os.path.exists(f"{self.save_path}/best_model.zip"):
+            # Load the best model to get its state dict
             best_model = PPO.load(f"{self.save_path}/best_model")
+            
+            # Save in PyTorch format
             torch.save({
                 'policy_state_dict': best_model.policy.state_dict(),
                 'optimizer_state_dict': best_model.policy.optimizer.state_dict()
             }, f"{self.save_path}/ppo_car_racing_best.pt")
             
+            # Also save with proper naming in SB3 format
+            best_model.save(f"{self.save_path}/ppo_car_racing_best")
+            
             if self.verbose > 0:
                 print(f"Saved best PyTorch model to {self.save_path}/ppo_car_racing_best.pt")
+                print(f"Saved best SB3 model to {self.save_path}/ppo_car_racing_best.zip")
 
 def make_env():
     """Create and wrap the CarRacing environment"""
     def _init():
         env = gym.make("CarRacing-v3", continuous=True)
         env = Monitor(env, "logs/car_racing_ppo")
+        # NO RESIZE - keep original 96x96 size
         return env
     return _init
 
 # Create and wrap the training environment
 env = DummyVecEnv([make_env()])
 env = VecFrameStack(env, n_stack=4)  # Stack 4 frames to capture motion information
+env = VecTransposeImage(env)  # Convert from (H,W,C) to (C,H,W)
 
 # Separate environment for evaluation with the same wrappers
 eval_env = DummyVecEnv([make_env()])
 eval_env = VecFrameStack(eval_env, n_stack=4)
 eval_env = VecTransposeImage(eval_env) 
 
-# Initialize the PPO agent
+# Initialize the PPO agent with parameters closer to the original
 model = PPO(
     policy="CnnPolicy",
     env=env,
@@ -102,6 +117,3 @@ model.learn(
 )
 
 print("Training complete!")
-
-# Save the final model in SB3 format too
-model.save("models/ppo_car_racing_final")

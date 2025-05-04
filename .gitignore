@@ -2,8 +2,14 @@ slurm/
 logs/
 *.err
 *.out
-
-models/a2c_car_racing_step*
-models/sac_car_racing_step*
 *.pyc
 
+archive/*
+comparison_results_*
+# Ignore everything in models directory
+models/*
+
+# But keep these specific files
+!models/ppo_car_racing_best.pt
+!models/ppo_car_racing_best.zip
+!models/sac_car_racing_best.pt

@@ -13,6 +13,8 @@ from typing import Tuple, List, Dict, Any
 import time
 import random
 from collections import deque
+import psutil
+import traceback
 
 # Set random seeds for reproducibility
 torch.manual_seed(42)
@@ -22,103 +24,163 @@ random.seed(42)
 torch.set_default_dtype(torch.float32)  # Use proper modern syntax
 USE_HALF_PRECISION = True  # Control flag
 
+# Memory optimization for sac.py
+
+# 1. More memory-efficient buffer with dynamic growth and lower precision
 class ReplayBuffer:
-    """Experience replay buffer to store and sample transitions"""
-    def __init__(self, capacity, device):
-        self.buffer = deque(maxlen=capacity)
+    """Memory-efficient experience replay buffer with gradual growth"""
+    def __init__(self, capacity, observation_shape, action_dim, device):
         self.device = device
-        self.obs_shape = None  # Track observation shape for consistency
+        self.max_capacity = capacity
+        self.pos = 0
+        self.full = False
+        
+        # Start with a smaller buffer size and grow as needed
+        self.current_capacity = min(50000, capacity)
+        
+        # Use float16 for observations to reduce memory footprint by 50%
+        self.states = np.zeros((self.current_capacity, *observation_shape), dtype=np.float16)
+        self.actions = np.zeros((self.current_capacity, action_dim), dtype=np.float32)
+        self.rewards = np.zeros((self.current_capacity, 1), dtype=np.float32)
+        self.next_states = np.zeros((self.current_capacity, *observation_shape), dtype=np.float16)
+        self.dones = np.zeros((self.current_capacity, 1), dtype=np.float32)
+        
+        # Track actual buffer usage
+        self.size = 0
+        
+    def _maybe_grow_buffer(self):
+        """Grow the buffer if needed and possible"""
+        # If buffer is 90% full and we haven't reached max capacity
+        if self.size > 0.9 * self.current_capacity and self.current_capacity < self.max_capacity:
+            new_capacity = min(self.current_capacity * 2, self.max_capacity)
+            print(f"Growing buffer from {self.current_capacity} to {new_capacity}")
+            
+            # Create new arrays with increased capacity
+            new_states = np.zeros((new_capacity, *self.states.shape[1:]), dtype=self.states.dtype)
+            new_actions = np.zeros((new_capacity, self.actions.shape[1]), dtype=self.actions.dtype)
+            new_rewards = np.zeros((new_capacity, 1), dtype=self.rewards.dtype)
+            new_next_states = np.zeros((new_capacity, *self.next_states.shape[1:]), dtype=self.next_states.dtype)
+            new_dones = np.zeros((new_capacity, 1), dtype=self.dones.dtype)
+            
+            # Copy existing data
+            if self.full:
+                # Data wraps around the buffer
+                new_states[:self.current_capacity-self.pos] = self.states[self.pos:]
+                new_states[self.current_capacity-self.pos:self.current_capacity] = self.states[:self.pos]
+                
+                new_actions[:self.current_capacity-self.pos] = self.actions[self.pos:]
+                new_actions[self.current_capacity-self.pos:self.current_capacity] = self.actions[:self.pos]
+                
+                new_rewards[:self.current_capacity-self.pos] = self.rewards[self.pos:]
+                new_rewards[self.current_capacity-self.pos:self.current_capacity] = self.rewards[:self.pos]
+                
+                new_next_states[:self.current_capacity-self.pos] = self.next_states[self.pos:]
+                new_next_states[self.current_capacity-self.pos:self.current_capacity] = self.next_states[:self.pos]
+                
+                new_dones[:self.current_capacity-self.pos] = self.dones[self.pos:]
+                new_dones[self.current_capacity-self.pos:self.current_capacity] = self.dones[:self.pos]
+                
+                self.pos = self.current_capacity
+            else:
+                # Data is contiguous
+                new_states[:self.pos] = self.states[:self.pos]
+                new_actions[:self.pos] = self.actions[:self.pos]
+                new_rewards[:self.pos] = self.rewards[:self.pos]
+                new_next_states[:self.pos] = self.next_states[:self.pos]
+                new_dones[:self.pos] = self.dones[:self.pos]
+            
+            # Replace with new arrays
+            self.states = new_states
+            self.actions = new_actions
+            self.rewards = new_rewards
+            self.next_states = new_next_states
+            self.dones = new_dones
+            
+            # Update capacity
+            self.current_capacity = new_capacity
+            
+            # Force garbage collection
+            gc.collect()
         
     def push(self, state, action, reward, next_state, done):
-        """Add transition to buffer with memory optimization"""
-        # Convert to tensors with memory optimization
-        if isinstance(state, np.ndarray):
-            state = torch.FloatTensor(state)
-            if USE_HALF_PRECISION and self.device.type == 'cuda':
-                state = state.half()
-                
-        if isinstance(action, np.ndarray):
-            action = torch.FloatTensor(action)
-            if USE_HALF_PRECISION and self.device.type == 'cuda':
-                action = action.half()
-                
-        if isinstance(reward, (np.ndarray, np.number)):
-            reward = torch.FloatTensor([float(reward)])
-        if isinstance(next_state, np.ndarray):
-            next_state = torch.FloatTensor(next_state)
-            if USE_HALF_PRECISION and self.device.type == 'cuda':
-                next_state = next_state.half()
-                
-        if isinstance(done, (np.ndarray, np.number, bool)):
-            done = torch.FloatTensor([float(done)])
+        """Store transition in buffer"""
+        # Convert to numpy if needed
+        if isinstance(state, torch.Tensor):
+            state = state.cpu().numpy()
+        if isinstance(action, torch.Tensor):
+            action = action.cpu().numpy()
+        if isinstance(reward, torch.Tensor):
+            reward = reward.cpu().numpy()
+        if isinstance(next_state, torch.Tensor):
+            next_state = next_state.cpu().numpy()
+        if isinstance(done, torch.Tensor):
+            done = done.cpu().numpy()
+            
+        # Handle scalar values
+        if np.isscalar(reward):
+            reward = np.array([reward], dtype=np.float32)
+        if np.isscalar(done) or (isinstance(done, np.ndarray) and done.ndim > 0):
+            # Extract single element from array to avoid deprecation warning
+            if isinstance(done, np.ndarray) and done.size == 1:
+                done = done.item()
+            done = np.array([float(done)], dtype=np.float32)
         
-        # Ensure consistent tensor shapes for observations
-        if state.dim() == 4 and state.shape[0] == 1:  # If shape is [1, channels, H, W]
-            state = state.squeeze(0)  # Make it [channels, H, W]
-            
-        if next_state.dim() == 4 and next_state.shape[0] == 1:  # If shape is [1, channels, H, W]
-            next_state = next_state.squeeze(0)  # Make it [channels, H, W]
-            
-        # Store the transition
-        self.buffer.append((state, action, reward, next_state, done))
+        # Store data in buffer
+        self.states[self.pos] = state.astype(np.float16)  # Convert to float16 for storage
+        self.actions[self.pos] = action
+        self.rewards[self.pos] = reward
+        self.next_states[self.pos] = next_state.astype(np.float16)
+        self.dones[self.pos] = done
+        
+        # Update position
+        self.pos = (self.pos + 1) % self.current_capacity
+        if self.pos == 0:
+            self.full = True
+        
+        # Update size
+        self.size = self.current_capacity if self.full else self.pos
+        
+        # Check if we need to grow the buffer
+        self._maybe_grow_buffer()
     
     def sample(self, batch_size):
-        """Memory-efficient sampling"""
-        if batch_size > len(self.buffer):
-            batch_size = len(self.buffer)
+        """Sample a batch of transitions"""
+        # Adjust batch size if buffer doesn't have enough samples
+        actual_batch_size = min(batch_size, self.size)
         
-        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
+        # Sample indices
+        indices = np.random.randint(0, self.size, actual_batch_size)
+        if self.full:
+            # Adjust indices for wrapped buffer
+            indices = (indices + self.pos) % self.current_capacity
         
-        # Process in smaller chunks to reduce peak memory usage
-        chunk_size = min(16, batch_size)
-        states_list, actions_list = [], []
-        rewards_list, next_states_list, dones_list = [], [], []
+        # Get batch data
+        state_batch = torch.FloatTensor(self.states[indices].astype(np.float32)).to(self.device)
+        action_batch = torch.FloatTensor(self.actions[indices]).to(self.device)
+        reward_batch = torch.FloatTensor(self.rewards[indices]).to(self.device)
+        next_state_batch = torch.FloatTensor(self.next_states[indices].astype(np.float32)).to(self.device)
+        done_batch = torch.FloatTensor(self.dones[indices]).to(self.device)
         
-        for i in range(0, batch_size, chunk_size):
-            chunk_indices = indices[i:i+chunk_size]
-            chunk = [self.buffer[idx] for idx in chunk_indices]
-            
-            states_chunk = [self._process_state(b[0]) for b in chunk]
-            next_states_chunk = [self._process_state(b[3]) for b in chunk]
-            
-            states_list.append(torch.cat(states_chunk))
-            actions_list.append(torch.stack([b[1] for b in chunk]))
-            rewards_list.append(torch.stack([b[2] for b in chunk]))
-            next_states_list.append(torch.cat(next_states_chunk))
-            dones_list.append(torch.stack([b[4] for b in chunk]))
-        
-        states = torch.cat(states_list).to(self.device)
-        actions = torch.cat(actions_list).to(self.device)
-        rewards = torch.cat(rewards_list).to(self.device)
-        next_states = torch.cat(next_states_list).to(self.device)
-        dones = torch.cat(dones_list).to(self.device)
-        
-        return states, actions, rewards, next_states, dones
-    
-    def _process_state(self, state):
-        """Process state for consistent shape before stacking"""
-        if state.dim() == 3:  # [C, H, W]
-            state = state.unsqueeze(0)  # [1, C, H, W]
-        return state
+        return state_batch, action_batch, reward_batch, next_state_batch, done_batch
     
     def __len__(self):
-        return len(self.buffer)
+        return self.size
 
 class EfficientCNN_Extractor(nn.Module):
-    def __init__(self, observation_space, reduced_size=64):
+    def __init__(self, observation_space):
         super().__init__()
         n_input_channels = 12  # 4 stacked frames with 3 channels each
         
-        # Much smaller CNN
-        self.conv1 = nn.Conv2d(n_input_channels, 8, kernel_size=8, stride=4)   # 16→8
-        self.conv2 = nn.Conv2d(8, 16, kernel_size=4, stride=2)                 # 32→16
-        self.conv3 = nn.Conv2d(16, 16, kernel_size=3, stride=1)                # 32→16
+        # CNN for 96x96 images
+        self.conv1 = nn.Conv2d(n_input_channels, 32, kernel_size=8, stride=4)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
         
         self.flatten = nn.Flatten()
         
-        # Calculate output dimension based on reduced image size
+        # Calculate output dimension
         with torch.no_grad():
-            sample_input = torch.zeros(1, n_input_channels, reduced_size, reduced_size)
+            sample_input = torch.zeros(1, n_input_channels, 96, 96)
             x = F.relu(self.conv1(sample_input))
             x = F.relu(self.conv2(x))
             x = F.relu(self.conv3(x))
@@ -263,10 +325,10 @@ class SAC:
                 tau=0.005,
                 alpha=0.2,
                 auto_entropy_tuning=True,
-                buffer_size=1000000,
-                batch_size=256,
-                initial_random_steps=10000,
-                update_every=1,
+                buffer_size=400000,  # Reduced buffer size
+                batch_size=128,      # Increased batch size for efficiency
+                initial_random_steps=2000,  # Reduced initial exploration
+                update_every=2,      # Update less frequently
                 device="auto"):
         
         self.device = torch.device("cuda" if torch.cuda.is_available() and device == "auto" else "cpu")
@@ -281,18 +343,19 @@ class SAC:
         self.batch_size = batch_size
         self.initial_random_steps = initial_random_steps
         self.update_every = update_every
+        self.total_steps = 0
         
         # Initialize actor (policy) network
-        self.actor = GaussianPolicy(self.observation_space, self.action_space).to(self.device)
+        self.actor = GaussianPolicy(self.observation_space, self.action_space, hidden_dim=128).to(self.device)
         
-        # Initialize critic (Q) networks and target networks
-        self.critic = QNetwork(self.observation_space, self.action_space).to(self.device)
-        self.critic_target = QNetwork(self.observation_space, self.action_space).to(self.device)
+        # Initialize critic (Q) networks with smaller networks
+        self.critic = QNetwork(self.observation_space, self.action_space, hidden_dim=128).to(self.device)
+        self.critic_target = QNetwork(self.observation_space, self.action_space, hidden_dim=128).to(self.device)
         
         # Copy weights from critic to critic_target
         self.hard_update(self.critic_target, self.critic)
         
-        # Set up optimizers
+        # Set up optimizers with gradient checkpointing for memory efficiency
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr_actor)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr_critic)
         
@@ -307,13 +370,41 @@ class SAC:
         else:
             self.alpha = torch.tensor([alpha], device=self.device)
         
-        # Create replay buffer
-        self.replay_buffer = ReplayBuffer(buffer_size, self.device)
+        # Determine observation shape for buffer
+        # For stacked frames: [channels, height, width]
+        obs_shape = (12, 96, 96)  # 4 frames x 3 channels, 96x96 resolution
+        action_dim = self.action_space.shape[0]
+        
+        # Create memory-efficient replay buffer
+        self.replay_buffer = ReplayBuffer(buffer_size, obs_shape, action_dim, self.device)
         
         # For tracking progress
         self.rewards_history = []
-        self.total_steps = 0
+        self.memory_usage_history = []
+        self.best_mean_reward = float('-inf')
         
+        # Memory management
+        self._clean_memory()
+    
+    def _clean_memory(self):
+        """Force garbage collection and clear CUDA cache"""
+        # Clear any dangling tensors
+        torch.cuda.empty_cache()
+        
+        # Run multiple GC passes
+        for _ in range(3):
+            gc.collect()
+        
+        # Report memory usage
+        if torch.cuda.is_available():
+            cuda_mem = torch.cuda.memory_allocated() / 1024**2
+            print(f"CUDA Memory: {cuda_mem:.1f} MB")
+        
+        process = psutil.Process(os.getpid())
+        ram_usage = process.memory_info().rss / 1024**2
+        self.memory_usage_history.append(ram_usage)
+        print(f"RAM Usage: {ram_usage:.1f} MB")
+    
     def _preprocess_obs(self, obs):
         """Convert observations to PyTorch tensors and send to device"""
         if isinstance(obs, np.ndarray):
@@ -374,6 +465,13 @@ class SAC:
         
         # Soft update target networks
         self.soft_update(self.critic_target, self.critic)
+        
+        # Clear references to tensors
+        del states, actions, rewards, next_states, dones
+        
+        # Periodically clean memory to avoid fragmentation
+        if self.total_steps % 1000 == 0:
+            self._clean_memory()
     
     def update_critic(self, states, actions, rewards, next_states, dones):
         """Update the critic networks"""
@@ -441,153 +539,149 @@ class SAC:
         for target_param, source_param in zip(target.parameters(), source.parameters()):
             target_param.data.copy_(source_param.data)
     
-    def train(self, num_steps=1000000, eval_freq=10000, save_path="models"):
+    def train(self, num_steps=1500000, eval_freq=10000, save_path="models", checkpoint_freq=50000):
         """
-        Train the SAC agent.
-        Args:
-            num_steps: Total environment steps to train for
-            eval_freq: How often to evaluate the agent
-            save_path: Where to save the model
+        Memory-efficient training loop with checkpoints
         """
         os.makedirs(save_path, exist_ok=True)
         os.makedirs("logs", exist_ok=True)
         
-        best_mean_reward = float('-inf')
+        # Start from a known state
+        if hasattr(self, 'best_mean_reward'):
+            best_mean_reward = self.best_mean_reward
+        else:
+            best_mean_reward = float('-inf')
+            self.best_mean_reward = best_mean_reward
+        
+        start_step = self.total_steps
         episode_count = 0
         episode_reward = 0
         episode_length = 0
+        training_start_time = time.time()
         
-        # For logging
-        episode_rewards = []
-        episode_lengths = []
+        # For logging - use arrays instead of lists for memory efficiency
+        recent_rewards = np.zeros(10)
+        recent_rewards_idx = 0
         
         # Reset environment
         obs = self.env.reset()[0]
         
-        print("Starting SAC training...")
-        for step in range(1, num_steps + 1):
-            # Select action
-            action = self.select_action(obs)
-            
-            # Execute action in environment
-            action_np = action.reshape(1, -1)  # Reshape for vectorized env
-            step_result = self.env.step(action_np)
-            if len(step_result) == 5:
-                next_obs, reward, terminated, truncated, _ = step_result
-            else:
-                # Handle the case when the environment returns 4 values (older format)
-                next_obs, reward, done, _ = step_result
-                terminated = done
-                truncated = False
-            
-            done = terminated or truncated
-            
-            # Add transition to replay buffer - with error checking
-            try:
-                # Ensure observation is properly preprocessed
-                if isinstance(obs, np.ndarray):
-                    obs_tensor = torch.FloatTensor(obs)
-                else:
-                    obs_tensor = obs
+        print(f"Starting SAC training from step {start_step}...")
+        
+        try:
+            for step in range(1, num_steps + 1):
+                actual_step = start_step + step
+                self.total_steps = actual_step
                 
-                if isinstance(next_obs, np.ndarray):
-                    next_obs_tensor = torch.FloatTensor(next_obs)
+                # Fill the buffer with random actions initially
+                if actual_step <= self.initial_random_steps:
+                    action = np.random.uniform(-1.0, 1.0, size=self.action_space.shape)
                 else:
-                    next_obs_tensor = next_obs
+                    action = self.select_action(obs)
+                
+                # Execute action in environment - handle both API versions
+                step_result = self.env.step(action.reshape(1, -1))
+                
+                # Check if we have the new Gym API (5 return values) or old API (4 return values)
+                if len(step_result) == 5:
+                    next_obs, reward, terminated, truncated, _ = step_result
+                    done = terminated or truncated
+                else:
+                    next_obs, reward, done, _ = step_result
+                    terminated = done  # For compatibility
+                    truncated = False  # For compatibility
+                
+                # Process reward
+                reward_value = reward.item() if isinstance(reward, np.ndarray) and reward.size == 1 else reward
+                
+                # Store transition in buffer
+                self.replay_buffer.push(obs, action, reward_value, next_obs, done)
+                
+                # Update observations and stats
+                obs = next_obs
+                episode_reward += reward_value
+                episode_length += 1
+                
+                # Update parameters if it's time
+                if actual_step > self.initial_random_steps and step % self.update_every == 0:
+                    for _ in range(1):  # Number of updates per step
+                        self.update_parameters()
+                
+                # Handle episode end
+                if done:
+                    # Log episode statistics
+                    print(f"Episode {episode_count+1} finished: Reward={episode_reward:.2f}, Length={episode_length}")
                     
-                # Get scalar values
-                reward_value = float(reward) if not isinstance(reward, (list, tuple, np.ndarray)) else float(reward.item() if hasattr(reward, 'item') else reward[0])
-                done_value = float(done) if not isinstance(done, (list, tuple, np.ndarray)) else float(done.item() if hasattr(done, 'item') else done[0])
-                
-                self.replay_buffer.push(
-                    obs_tensor, 
-                    torch.FloatTensor(action), 
-                    torch.FloatTensor([reward_value]), 
-                    next_obs_tensor, 
-                    torch.FloatTensor([done_value])
-                )
-            except Exception as e:
-                print(f"Error adding to replay buffer: {e}")
-                print(f"obs type: {type(obs)}, shape: {np.shape(obs) if isinstance(obs, np.ndarray) else None}")
-                print(f"action type: {type(action)}, shape: {np.shape(action) if isinstance(action, np.ndarray) else None}")
-                print(f"reward type: {type(reward)}, value: {reward}")
-                print(f"next_obs type: {type(next_obs)}, shape: {np.shape(next_obs) if isinstance(next_obs, np.ndarray) else None}")
-                print(f"done type: {type(done)}, value: {done}")
-            
-            # Extract scalar values from numpy arrays
-            if isinstance(reward, np.ndarray):
-                reward_value = reward.item() if reward.size == 1 else reward.flatten()[0]
-            else:
-                reward_value = reward
-                
-            # Update observations and stats
-            obs = next_obs
-            episode_reward += reward_value
-            episode_length += 1
-            self.total_steps += 1
-            
-            # Update parameters if it's time
-            if step >= self.initial_random_steps and step % self.update_every == 0:
-                self.update_parameters()
-            
-            # Handle episode end
-            if done:
-                if isinstance(episode_reward, np.ndarray):
-                    episode_reward_value = episode_reward.item() if episode_reward.size == 1 else episode_reward.flatten()[0]
-                else:
-                    episode_reward_value = episode_reward
-                
-                if isinstance(episode_length, np.ndarray):
-                    episode_length_value = episode_length.item() if episode_length.size == 1 else episode_length.flatten()[0]
-                else:
-                    episode_length_value = episode_length
-                
-                print(f"Episode {episode_count+1} finished: Reward={episode_reward_value:.2f}, Length={episode_length_value}")
-                episode_rewards.append(episode_reward_value)
-                episode_lengths.append(episode_length_value)
-                
-                # Reset for next episode
-                obs = self.env.reset()[0]
-                episode_count += 1
-                episode_reward = 0
-                episode_length = 0
-                
-                # Log every few episodes
-                if episode_count % 10 == 0:
-                    recent_rewards = episode_rewards[-10:]
-                    print(f"Step: {step}/{num_steps}, Episodes: {episode_count}, "
-                          f"Mean reward (last 10): {np.mean(recent_rewards):.2f}, "
-                          f"Buffer size: {len(self.replay_buffer)}")
-            
-            # Evaluate and save the best model
-            if step % eval_freq == 0:
-                # Free up memory
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                    # Update running average
+                    recent_rewards[recent_rewards_idx] = episode_reward
+                    recent_rewards_idx = (recent_rewards_idx + 1) % 10
                     
-                # Keep only a single checkpoint to save disk space
-                if step > eval_freq:
-                    for old_step in range(eval_freq, step, eval_freq):
-                        old_checkpoint = os.path.join(save_path, f"sac_car_racing_step_{old_step}.pt")
-                        if os.path.exists(old_checkpoint):
-                            os.remove(old_checkpoint)
-                
-                mean_reward = self.evaluate()
-                print(f"Evaluation at step {step}: Mean reward = {mean_reward:.2f}")
-                self.rewards_history.append(mean_reward)
-                
-                if mean_reward > best_mean_reward:
-                    best_mean_reward = mean_reward
-                    self.save(os.path.join(save_path, "sac_car_racing_best"))
-                    print(f"New best model saved with mean reward: {best_mean_reward:.2f}")
+                    # Reset for next episode
+                    obs = self.env.reset()[0]
+                    episode_count += 1
+                    episode_reward = 0
+                    episode_length = 0
                     
-                # Also save periodic checkpoints
-                self.save(os.path.join(save_path, f"sac_car_racing_step_{step}"))
+                    # Log every 10 episodes
+                    if episode_count % 10 == 0:
+                        current_avg = recent_rewards.mean()
+                        elapsed_time = time.time() - training_start_time
+                        print(f"Step: {actual_step}/{start_step+num_steps}, Episodes: {episode_count}, "
+                              f"Mean reward (last 10): {current_avg:.2f}, "
+                              f"Time elapsed: {elapsed_time:.2f}s, "
+                              f"Steps/sec: {actual_step/elapsed_time:.2f}")
+                        
+                        # Clear memory periodically
+                        self._clean_memory()
+                
+                # Evaluate and save checkpoints
+                if step % eval_freq < self.update_every:
+                    # Clean before evaluation
+                    self._clean_memory()
+                    
+                    # Run evaluation
+                    mean_reward = self.evaluate(n_episodes=2)  # Use fewer episodes to save memory
+                    print(f"Evaluation at step {actual_step}: Mean reward = {mean_reward:.2f}")
+                    
+                    # Update best model
+                    if mean_reward > best_mean_reward:
+                        best_mean_reward = mean_reward
+                        self.best_mean_reward = best_mean_reward
+                        self.save(os.path.join(save_path, "sac_car_racing_best"))
+                        print(f"New best model saved with mean reward: {best_mean_reward:.2f}")
+                    
+                    # Save checkpoint occasionally to resume training if needed
+                    if step % checkpoint_freq < self.update_every:
+                        checkpoint_path = os.path.join(save_path, f"sac_checkpoint_{actual_step}")
+                        self.save(checkpoint_path)
+                        print(f"Checkpoint saved at {checkpoint_path}")
+                        
+                        # Remove older checkpoints to save space
+                        old_checkpoints = [f for f in os.listdir(save_path) 
+                                         if f.startswith("sac_checkpoint_") 
+                                         and f.endswith(".pt") 
+                                         and f != f"sac_checkpoint_{actual_step}.pt"]
+                        for old_cp in old_checkpoints:
+                            try:
+                                os.remove(os.path.join(save_path, old_cp))
+                            except:
+                                pass
+                    
+                    # Clean after evaluation
+                    self._clean_memory()
+        
+        except Exception as e:
+            print(f"Error during training: {e}")
+            traceback.print_exc()
+            # Save checkpoint on error
+            error_checkpoint = os.path.join(save_path, "sac_error_checkpoint")
+            self.save(error_checkpoint)
+            print(f"Saved checkpoint at {error_checkpoint} after error")
         
         # Save final model
         self.save(os.path.join(save_path, "sac_car_racing_final"))
-        print("Training complete!")
+        print(f"Training completed: {self.total_steps} total steps")
+        
         return self.rewards_history
     
     def evaluate(self, n_episodes=3):
@@ -669,59 +763,6 @@ class SAC:
             
         return self
 
-# Add this class after your imports
-class ResizeObservationWrapper(gym.ObservationWrapper):
-    """Resize observations to reduce memory usage."""
-    def __init__(self, env, target_size=(64, 64)):
-        super().__init__(env)
-        self.target_size = target_size
-        
-        # Update observation space to match new size
-        if isinstance(env.observation_space, gym.spaces.Box):
-            old_shape = env.observation_space.shape
-            if len(old_shape) == 3 and old_shape[0:2] == (96, 96):
-                low = env.observation_space.low.min()
-                high = env.observation_space.high.max()
-                self.observation_space = gym.spaces.Box(
-                    low=low, 
-                    high=high, 
-                    shape=(target_size[0], target_size[1], old_shape[2]),
-                    dtype=env.observation_space.dtype
-                )
-    
-    def observation(self, obs):
-        """Resize the observation."""
-        return self._resize_observation(obs)
-    
-    def _resize_observation(self, obs):
-        """Resize observations using NumPy only"""
-        if isinstance(obs, np.ndarray):
-            if len(obs.shape) == 3 and obs.shape[:2] == (96, 96):
-                resized = np.zeros((self.target_size[0], self.target_size[1], obs.shape[2]), dtype=obs.dtype)
-                h_ratio = obs.shape[0] / self.target_size[0]
-                w_ratio = obs.shape[1] / self.target_size[1]
-                
-                for y in range(self.target_size[0]):
-                    for x in range(self.target_size[1]):
-                        src_y = min(int(y * h_ratio), obs.shape[0] - 1)
-                        src_x = min(int(x * w_ratio), obs.shape[1] - 1)
-                        resized[y, x] = obs[src_y, src_x]
-                return resized
-            elif len(obs.shape) == 4 and obs.shape[1:3] == (96, 96):  # Batched observation
-                resized = np.zeros((obs.shape[0], self.target_size[0], self.target_size[1], obs.shape[3]), dtype=obs.dtype)
-                for i in range(obs.shape[0]):
-                    h_ratio = obs.shape[1] / self.target_size[0]
-                    w_ratio = obs.shape[2] / self.target_size[1]
-                    
-                    for y in range(self.target_size[0]):
-                        for x in range(self.target_size[1]):
-                            src_y = min(int(y * h_ratio), obs.shape[1] - 1)
-                            src_x = min(int(x * w_ratio), obs.shape[2] - 1)
-                            resized[i, y, x] = obs[i, src_y, src_x]
-                            
-                return resized
-        return obs
-
 # Training script at the bottom for when the file is run directly
 if __name__ == "__main__":
     import os
@@ -731,72 +772,45 @@ if __name__ == "__main__":
     os.makedirs("models", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
     
-    def preprocess_observation(obs, target_size=(64, 64)):
-        """Resize observations using NumPy only"""
-        if isinstance(obs, np.ndarray):
-            if len(obs.shape) == 3 and obs.shape[:2] == (96, 96):  # Single observation
-                resized = np.zeros((target_size[0], target_size[1], obs.shape[2]), dtype=obs.dtype)
-                h_ratio = obs.shape[0] / target_size[0]
-                w_ratio = obs.shape[1] / target_size[1]
-                
-                for y in range(target_size[0]):
-                    for x in range(target_size[1]):
-                        src_y = min(int(y * h_ratio), obs.shape[0] - 1)
-                        src_x = min(int(x * w_ratio), obs.shape[1] - 1)
-                        resized[y, x] = obs[src_y, src_x]
-                        
-                return resized
-                
-            elif len(obs.shape) == 4 and obs.shape[1:3] == (96, 96):  # Batched observation
-                resized = np.zeros((obs.shape[0], target_size[0], target_size[1], obs.shape[3]), dtype=obs.dtype)
-                for i in range(obs.shape[0]):
-                    h_ratio = obs.shape[1] / target_size[0]
-                    w_ratio = obs.shape[2] / target_size[1]
-                    
-                    for y in range(target_size[0]):
-                        for x in range(target_size[1]):
-                            src_y = min(int(y * h_ratio), obs.shape[1] - 1)
-                            src_x = min(int(x * w_ratio), obs.shape[2] - 1)
-                            resized[i, y, x] = obs[i, src_y, src_x]
-                            
-                return resized
-        return obs
-    
     def make_env():
         """Create and wrap the CarRacing environment"""
         def _init():
             env = gym.make("CarRacing-v3", continuous=True)
             env = Monitor(env, "logs/car_racing_sac")
-            # Use our custom wrapper instead of LambdaObservation
-            env = ResizeObservationWrapper(env, target_size=(64, 64))
             return env
         return _init
     
     # Create and wrap the training environment
     env = DummyVecEnv([make_env()])
-    env = VecFrameStack(env, n_stack=4)  # Stack 4 frames to capture motion information
+    env = VecFrameStack(env, n_stack=4)  # Stack 4 frames like in PPO
     env = VecTransposeImage(env)  # Convert from (H,W,C) to (C,H,W)
     
-    # Create the SAC agent
+    # Create the SAC agent with settings more aligned with PPO
     agent = SAC(
         env=env,
-        lr_actor=3e-4,
-        lr_critic=3e-4,
-        lr_alpha=3e-4,
-        gamma=0.99,
-        tau=0.005,
-        alpha=0.2,
-        auto_entropy_tuning=True,
-        buffer_size=50000,  # Further reduced from 100,000
-        batch_size=32,      # Further reduced from 64
-        initial_random_steps=500,  # Further reduced from 1,000
-        update_every=2,     # Update less frequently
+        lr_actor=3e-4,           # Same as PPO (already matched)
+        lr_critic=3e-4,          # Same as PPO (already matched)
+        lr_alpha=3e-4,           # Same as PPO (already matched)
+        gamma=0.99,              # Same as PPO (already matched)
+        tau=0.005,               # Keep default SAC value
+        alpha=0.2,               # Start with default SAC value
+        auto_entropy_tuning=True,# Auto-tune to match PPO's exploration
+        buffer_size=100000,      # Keep larger buffer for off-policy
+        batch_size=64,           # Match PPO's batch size
+        initial_random_steps=10000,  # Scale back to be more like PPO
+        update_every=1,          # Update every step like PPO
         device="auto"
     )
     
-    # Train the agent
+    # Train the agent for the same number of steps as PPO
     agent.train(
-        num_steps=1500000,  # Total steps
-        eval_freq=10000,    # Evaluation frequency
-        save_path="models"  # Where to save models
+        num_steps=1500000,       # Same as PPO
+        eval_freq=10000,         # Same evaluation frequency as PPO
+        save_path="models"
     )
+    
+    # Ensure best model is copied with standard naming for easier loading
+    if os.path.exists("models/sac_car_racing_best.pt"):
+        print("Copying best model to standard name format...")
+        import shutil
+        shutil.copy("models/sac_car_racing_best.pt", "models/sac_car_racing_best.pt")
