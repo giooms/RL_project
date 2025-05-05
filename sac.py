@@ -720,11 +720,32 @@ class SAC:
         """Get action from policy for a single observation (interface compatibility)"""
         with torch.no_grad():
             obs_tensor = self._preprocess_obs(observation)
-            _, _, action_mean = self.actor.sample(obs_tensor)
-            action = action_mean if deterministic else self.select_action(observation)
+            if deterministic:
+                mean, _ = self.actor(obs_tensor)
+                action = torch.tanh(mean)
+            else:
+                action, _, _ = self.actor.sample(obs_tensor)
+                
+            # Ensure action is properly shaped as an array
+            action_np = action.cpu().numpy()
             
-        # Return in the format expected by interface.py
-        return action.cpu().numpy().flatten(), None
+            # If the action has a batch dimension, remove it for single observations
+            if len(action_np.shape) == 2 and action_np.shape[0] == 1:
+                action_np = action_np.squeeze(0)
+            
+            # Make sure we have a properly shaped [3,] action vector
+            if len(action_np) != 3:
+                # Pad or truncate action to have 3 dimensions
+                temp = np.zeros(3)
+                temp[:min(len(action_np), 3)] = action_np[:min(len(action_np), 3)]
+                action_np = temp
+                
+            # Ensure proper value ranges for car racing
+            action_np[0] = np.clip(action_np[0], -1.0, 1.0)  # Steering [-1,1]
+            action_np[1] = np.clip(action_np[1], 0.0, 1.0)   # Gas [0,1]
+            action_np[2] = np.clip(action_np[2], 0.0, 1.0)   # Brake [0,1]
+                
+        return action_np, None
     
     def save(self, path):
         """Save the model"""

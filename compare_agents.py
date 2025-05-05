@@ -4,6 +4,10 @@ import matplotlib.pyplot as plt
 import os
 import time
 import argparse
+import pandas as pd
+import torch
+import psutil
+from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecTransposeImage
 from load_agent import load_best_agent
 
 def parse_arguments():
@@ -29,6 +33,12 @@ def compare_algorithms(n_episodes=20, render=False, save_video=True, output_dir=
     if save_video:
         video_dir = os.path.join(output_dir, "videos")
         os.makedirs(video_dir, exist_ok=True)
+        
+        # Create separate directories for each algorithm
+        ppo_video_dir = os.path.join(video_dir, "ppo")
+        sac_video_dir = os.path.join(video_dir, "sac")
+        os.makedirs(ppo_video_dir, exist_ok=True)
+        os.makedirs(sac_video_dir, exist_ok=True)
     
     # Evaluation metrics to track
     metrics = {
@@ -40,81 +50,167 @@ def compare_algorithms(n_episodes=20, render=False, save_video=True, output_dir=
         print(f"\nEvaluating {algo.upper()}...")
         
         for episode in range(n_episodes):
-            # Set up video recording if enabled
-            if save_video:
-                video_path = os.path.join(video_dir, f"{algo}_episode_{episode}")
-                env = gym.make("CarRacing-v3", render_mode="rgb_array", continuous=True)
-                env = gym.wrappers.RecordVideo(env, video_path, episode_trigger=lambda x: True)
-            else:
-                render_mode = "human" if render else None
-                env = gym.make("CarRacing-v3", render_mode=render_mode, continuous=True)
+            # Set up rendering mode
+            render_mode = "rgb_array" if save_video else ("human" if render else None)
             
-            # Prepare environment for the specific algorithm
-            if algo == "ppo" or algo == "sac":
-                # Need to wrap in DummyVecEnv and other wrappers for both algorithms
-                from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecTransposeImage
-                env.close()  # Close the unwrapped env
-                env = DummyVecEnv([lambda: gym.make("CarRacing-v3", 
-                                                    render_mode="rgb_array" if save_video else render_mode, 
-                                                    continuous=True)])
+            # For vectorized environment with proper wrappers for models
+            def make_env():
+                def _init():
+                    env = gym.make("CarRacing-v3", render_mode=render_mode, continuous=True)
+                    
+                    # Add video recording if enabled
+                    if save_video:
+                        # Use the algorithm-specific video directory
+                        current_video_dir = os.path.join(video_dir, algo)
+                        # Ensure unique name for each episode
+                        episode_video_dir = os.path.join(current_video_dir, f"episode_{episode}")
+                        os.makedirs(episode_video_dir, exist_ok=True)
+                        env = gym.wrappers.RecordVideo(
+                            env, 
+                            episode_video_dir, 
+                            episode_trigger=lambda _: True,
+                            video_length=1000
+                        )
+                    return env
+                return _init
+                
+            env = None  # Initialize to None to prevent reference errors in finally block
+            
+            try:
+                # Create properly wrapped environment
+                env = DummyVecEnv([make_env()])
                 env = VecFrameStack(env, n_stack=4)
                 env = VecTransposeImage(env)
-            
-            # Load the appropriate agent
-            model = load_best_agent(algo)
-            
-            obs, _ = env.reset()
-            done = False
-            episode_reward = 0
-            episode_length = 0
-            trajectory = []
-            
-            while not done:
-                action, _ = model.predict(obs, deterministic=True)
-                obs, reward, terminated, truncated, info = env.step(action)
                 
-                # Handle vector environment outputs
-                if isinstance(reward, np.ndarray):
-                    reward = reward[0]
-                if isinstance(terminated, np.ndarray):
-                    terminated = terminated[0]
-                if isinstance(truncated, np.ndarray):
-                    truncated = truncated[0]
+                # Load the appropriate agent
+                model = load_best_agent(algo)
                 
-                episode_reward += reward
-                episode_length += 1
+                # For SAC, add predict method fix
+                if algo == "sac":
+                    print(f"SAC model loaded. Checking action output...")
+                    # Patch the predict method to ensure proper action shape
+                    original_predict = model.predict
+                    
+                    def patched_predict(observation, deterministic=True):
+                        with torch.no_grad():
+                            action, _ = original_predict(observation, deterministic)
+                            
+                            # Ensure action is a properly shaped numpy array
+                            if isinstance(action, (float, int)) or (isinstance(action, np.ndarray) and action.shape == ()):
+                                action = np.array([action, 0.0, 0.0])  # [steer, gas, brake]
+                            elif len(action.shape) == 1 and action.shape[0] == 1:
+                                action = np.array([action[0], 0.0, 0.0])
+                                
+                            # Ensure proper shape and limits for CarRacing
+                            if action.shape != (3,):
+                                action = np.zeros(3)
+                            
+                            # Clip values to valid ranges
+                            action[0] = np.clip(action[0], -1.0, 1.0)  # Steering
+                            action[1] = np.clip(action[1], 0.0, 1.0)   # Gas
+                            action[2] = np.clip(action[2], 0.0, 1.0)   # Brake
+                                
+                        return action, None
+                    
+                    # Replace the predict method
+                    model.predict = patched_predict
+                    
+                    # Test the fix
+                    test_obs = env.reset()[0]
+                    test_action, _ = model.predict(test_obs, deterministic=True)
+                    print(f"SAC test action shape: {test_action.shape}, value: {test_action}")
+                    print(f"Environment action space: {env.action_space}")
+
+                reset_result = env.reset()
+                if isinstance(reset_result, tuple):
+                    if len(reset_result) == 2:
+                        obs, _ = reset_result
+                    else:
+                        obs = reset_result[0]
+                else:
+                    obs = reset_result
+                done = False
+                episode_reward = 0
+                episode_length = 0
+                trajectory = []
                 
-                # Track position when possible (this will need adjustments for vector envs)
-                if hasattr(env, 'envs'):
-                    # For VecEnv
-                    pos = None
-                    try:
-                        if hasattr(env.envs[0].unwrapped, 'car'):
-                            pos = env.envs[0].unwrapped.car.hull.position
-                            trajectory.append((float(pos[0]), float(pos[1])))
-                    except (AttributeError, IndexError):
-                        pass
+                first_action, _ = model.predict(obs, deterministic=True)
+                print(f"First action: shape={first_action.shape}, value={first_action}")
+
+                while not done:
+                    action, _ = model.predict(obs, deterministic=True)
+                    
+                    # FIX: Add batch dimension to actions for vectorized environment
+                    if algo == "sac" and len(action.shape) == 1:
+                        action = action.reshape(1, -1)
+                    
+                    step_result = env.step(action)
+
+                    # For vector environments (length 4 output)
+                    if len(step_result) == 4:
+                        obs, reward, done, info = step_result
+                        terminated = done  # Vector environments combine terminated and truncated into 'done'
+                        truncated = False  # No separate truncated flag, just use done
+                    # For regular gym environments (length 5 output)
+                    else:
+                        obs, reward, terminated, truncated, info = step_result
+                    
+                    # Handle vector environment outputs
+                    if isinstance(reward, np.ndarray):
+                        reward = reward[0]
+                    if isinstance(terminated, np.ndarray):
+                        terminated = terminated[0]
+                    if isinstance(truncated, np.ndarray):
+                        truncated = truncated[0]
+                    
+                    episode_reward += reward
+                    episode_length += 1
+                    
+                    # Track position when possible (this will need adjustments for vector envs)
+                    if hasattr(env, 'envs'):
+                        # For VecEnv
+                        pos = None
+                        try:
+                            if hasattr(env.envs[0].unwrapped, 'car'):
+                                pos = env.envs[0].unwrapped.car.hull.position
+                                trajectory.append((float(pos[0]), float(pos[1])))
+                        except (AttributeError, IndexError):
+                            pass
+                    
+                    done = terminated or truncated
+                    
+                    # Track reason for episode end
+                    if done:
+                        if episode_length >= 1000:
+                            metrics[algo]["timeouts"] += 1
+                        elif episode_reward < -50:  # Threshold for crashes
+                            metrics[algo]["crashes"] += 1
+                        elif episode_reward > 800:  # Likely completed
+                            metrics[algo]["completions"] += 1
                 
-                done = terminated or truncated
+                # Record episode results
+                metrics[algo]["rewards"].append(episode_reward)
+                metrics[algo]["lengths"].append(episode_length)
+                if trajectory:
+                    metrics[algo]["trajectories"].append(trajectory)
                 
-                # Track reason for episode end
-                if done:
-                    if episode_length >= 1000:
-                        metrics[algo]["timeouts"] += 1
-                    elif episode_reward < -50:  # Threshold for crashes
-                        metrics[algo]["crashes"] += 1
-                    elif episode_reward > 800:  # Likely completed
-                        metrics[algo]["completions"] += 1
-            
-            # Record episode results
-            metrics[algo]["rewards"].append(episode_reward)
-            metrics[algo]["lengths"].append(episode_length)
-            if trajectory:
-                metrics[algo]["trajectories"].append(trajectory)
-            
-            print(f"{algo.upper()} - Episode {episode+1}: Reward = {episode_reward:.2f}, Length = {episode_length}")
-            
-            env.close()
+                print(f"{algo.upper()} - Episode {episode+1}: Reward = {episode_reward:.2f}, Length = {episode_length}")
+                
+                # Make sure to properly close the environment at the end of each episode
+                if env is not None:
+                    env.close()
+                    
+            except Exception as e:
+                print(f"Error in {algo} episode {episode}: {e}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                # Always close the environment to ensure videos get saved
+                if env is not None:
+                    env.close()
+                    # Give the system a moment to finish writing files
+                    import time
+                    time.sleep(1)
     
     # Save metrics to CSV
     for algo in metrics:

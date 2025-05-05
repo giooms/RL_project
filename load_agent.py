@@ -29,8 +29,11 @@ def load_best_agent(algorithm="ppo"):
     if algorithm.lower() == "ppo":
         # Create environment with proper wrappers for PPO - standard 96x96 size
         def make_env():
-            env = gym.make("CarRacing-v3", continuous=True)
-            return env
+            # Return a function that creates the environment when called
+            def _init():
+                env = gym.make("CarRacing-v3", continuous=True)
+                return env
+            return _init  # Return the function, not the result of calling it
         
         # Create properly wrapped environment
         env = DummyVecEnv([make_env()])
@@ -82,8 +85,11 @@ def load_best_agent(algorithm="ppo"):
     elif algorithm.lower() == "sac":
         # Create environment to initialize the agent - standard 96x96 size
         def make_env():
-            env = gym.make("CarRacing-v3", continuous=True)
-            return env
+            # Return a function that creates the environment when called
+            def _init():
+                env = gym.make("CarRacing-v3", continuous=True)
+                return env
+            return _init  # Return the function, not the result of calling it
             
         env = DummyVecEnv([make_env()])
         env = VecFrameStack(env, n_stack=4)
