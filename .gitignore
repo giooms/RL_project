@@ -3,6 +3,7 @@ logs/
 *.err
 *.out
 *.pyc
+*.mp4
 
 archive/*
 comparison_results_*

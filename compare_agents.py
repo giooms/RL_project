@@ -46,30 +46,44 @@ def compare_algorithms(n_episodes=20, render=False, save_video=True, output_dir=
         "sac": {"rewards": [], "lengths": [], "timeouts": 0, "crashes": 0, "completions": 0, "trajectories": []},
     }
     
-    for algo in ["ppo", "sac"]:
-        print(f"\nEvaluating {algo.upper()}...")
+    # Generate a list of seeds to use for each episode
+    # This ensures both algorithms face identical tracks
+    episode_seeds = [np.random.randint(0, 10000) for _ in range(n_episodes)]
+    print(f"Using fixed seeds for track generation: {episode_seeds}")
+    
+    for episode in range(n_episodes):
+        episode_seed = episode_seeds[episode]
+        print(f"\n--- Episode {episode+1}/{n_episodes} (Seed: {episode_seed}) ---")
         
-        for episode in range(n_episodes):
+        # Track metrics for this specific episode/track
+        episode_metrics = {
+            "ppo": {"reward": 0, "length": 0, "timeout": False, "crash": False, "completion": False, "trajectory": []},
+            "sac": {"reward": 0, "length": 0, "timeout": False, "crash": False, "completion": False, "trajectory": []}
+        }
+        
+        for algo in ["ppo", "sac"]:
+            print(f"\nRunning {algo.upper()}...")
+            
             # Set up rendering mode
             render_mode = "rgb_array" if save_video else ("human" if render else None)
             
             # For vectorized environment with proper wrappers for models
             def make_env():
                 def _init():
-                    env = gym.make("CarRacing-v3", render_mode=render_mode, continuous=True)
+                    # Create environment with the fixed seed for this episode
+                    env = gym.make("CarRacing-v3", continuous=True, domain_randomize=False)
+                    # Set the random seed for the environment (controls track generation)
+                    env.reset(seed=episode_seed)
                     
-                    # Add video recording if enabled
+                    # Add video recording if needed
                     if save_video:
-                        # Use the algorithm-specific video directory
                         current_video_dir = os.path.join(video_dir, algo)
-                        # Ensure unique name for each episode
                         episode_video_dir = os.path.join(current_video_dir, f"episode_{episode}")
                         os.makedirs(episode_video_dir, exist_ok=True)
                         env = gym.wrappers.RecordVideo(
                             env, 
                             episode_video_dir, 
-                            episode_trigger=lambda _: True,
-                            video_length=1000
+                            episode_trigger=lambda _: True
                         )
                     return env
                 return _init
@@ -181,9 +195,9 @@ def compare_algorithms(n_episodes=20, render=False, save_video=True, output_dir=
                     
                     # Track reason for episode end
                     if done:
-                        if episode_length >= 1000:
+                        if episode_length >= 2000:
                             metrics[algo]["timeouts"] += 1
-                        elif episode_reward < -50:  # Threshold for crashes
+                        elif episode_reward < -75:  # Threshold for crashes
                             metrics[algo]["crashes"] += 1
                         elif episode_reward > 800:  # Likely completed
                             metrics[algo]["completions"] += 1
@@ -211,6 +225,12 @@ def compare_algorithms(n_episodes=20, render=False, save_video=True, output_dir=
                     # Give the system a moment to finish writing files
                     import time
                     time.sleep(1)
+        
+        # After both algorithms have run on this track, print a comparison
+        print(f"\n--- Episode {episode+1} Results (Seed: {episode_seed}) ---")
+        print(f"PPO: Reward = {episode_metrics['ppo']['reward']:.2f}, Length = {episode_metrics['ppo']['length']}")
+        print(f"SAC: Reward = {episode_metrics['sac']['reward']:.2f}, Length = {episode_metrics['sac']['length']}")
+        print(f"Difference: {episode_metrics['ppo']['reward'] - episode_metrics['sac']['reward']:.2f}")
     
     # Save metrics to CSV
     for algo in metrics:

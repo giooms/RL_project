@@ -1,11 +1,31 @@
 import os
 import torch
+import numpy as np
 import gymnasium as gym
+from collections import deque
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecTransposeImage
 
 # Import SAC implementation
 from sac import SAC
+
+def create_frame_stack_preprocessor(orig_predict):
+    """Create a preprocessor that stacks frames for the model's predict method"""
+    # Buffer to store last 4 frames
+    frame_stack = deque(maxlen=4)
+    
+    def preprocess_and_predict(obs, deterministic=True):
+        # Add new frame to the stack
+        frame_stack.append(obs)
+        # If not enough frames yet, pad with copies of the first frame
+        while len(frame_stack) < 4:
+            frame_stack.appendleft(obs)
+        # Stack frames along the channel axis
+        stacked_obs = np.concatenate(frame_stack, axis=2)  # (96, 96, 12)
+        # Call the original predict
+        return orig_predict(stacked_obs, deterministic=deterministic)
+        
+    return preprocess_and_predict
 
 def load_best_agent(algorithm="ppo"):
     """
@@ -23,35 +43,30 @@ def load_best_agent(algorithm="ppo"):
     if not os.path.exists(model_dir):
         raise FileNotFoundError(f"Model directory not found: {model_dir}")
     
-    print(f"Looking for models in: {model_dir}")
-    print(f"Available files: {os.listdir(model_dir)}")
+    # Create properly wrapped environment for both algorithms
+    def make_env():
+        def _init():
+            env = gym.make("CarRacing-v3", continuous=True)
+            return env
+        return _init
+    
+    env = DummyVecEnv([make_env()])
+    env = VecFrameStack(env, n_stack=4)
+    env = VecTransposeImage(env)
     
     if algorithm.lower() == "ppo":
-        # Create environment with proper wrappers for PPO - standard 96x96 size
-        def make_env():
-            # Return a function that creates the environment when called
-            def _init():
-                env = gym.make("CarRacing-v3", continuous=True)
-                return env
-            return _init  # Return the function, not the result of calling it
-        
-        # Create properly wrapped environment
-        env = DummyVecEnv([make_env()])
-        env = VecFrameStack(env, n_stack=4)
-        env = VecTransposeImage(env)
-        
-        # Try loading from SB3 format first (our preferred format)
+        # Try loading from SB3 format first
         zip_path = os.path.join(model_dir, "ppo_car_racing_best.zip")
-        zip_path_no_ext = os.path.join(model_dir, "ppo_car_racing_best")
         
         if os.path.exists(zip_path):
             print(f"Loading PPO model from {zip_path}")
-            return PPO.load(zip_path, env=env)
-        elif os.path.exists(zip_path_no_ext + ".zip"):
-            print(f"Loading PPO model from {zip_path_no_ext}.zip")
-            return PPO.load(zip_path_no_ext, env=env)
+            model = PPO.load(zip_path, env=env)
+            
+            # Patch the predict method to handle single-frame observations
+            model.predict = create_frame_stack_preprocessor(model.predict)
+            return model
         
-        # Fallback to PyTorch format if needed
+        # Fall back to PyTorch format
         pt_path = os.path.join(model_dir, "ppo_car_racing_best.pt")
         if os.path.exists(pt_path):
             print(f"Loading PPO model from PyTorch file: {pt_path}")
@@ -60,64 +75,32 @@ def load_best_agent(algorithm="ppo"):
             # Load the PyTorch state dict
             checkpoint = torch.load(pt_path, map_location=torch.device('cpu'))
             model.policy.load_state_dict(checkpoint['policy_state_dict'])
+            
+            # Patch the predict method
+            model.predict = create_frame_stack_preprocessor(model.predict)
             return model
         
-        # Check for any other PPO model files - WITHOUT TRAINING NEW ONES
-        print("Warning: Could not find ppo_car_racing_best model. Looking for alternatives...")
-        ppo_files = [f for f in os.listdir(model_dir) if f.startswith("ppo_") and (f.endswith(".zip") or f.endswith(".pt"))]
-        
-        if ppo_files:
-            print(f"Found alternative PPO model files: {ppo_files}")
-            for file in ppo_files:
-                if file.endswith(".zip"):
-                    print(f"Loading alternative PPO model from {file}")
-                    return PPO.load(os.path.join(model_dir, file[:-4]), env=env)
-                elif file.endswith(".pt"):
-                    print(f"Loading alternative PPO model from {file}")
-                    model = PPO("CnnPolicy", env)
-                    checkpoint = torch.load(os.path.join(model_dir, file), map_location=torch.device('cpu'))
-                    model.policy.load_state_dict(checkpoint['policy_state_dict'])
-                    return model
-        
         # If we get here, no suitable model was found
-        raise FileNotFoundError(f"No PPO model found in {model_dir}. Please train a model first.")
+        raise FileNotFoundError(f"PPO model file not found. Expected either:\n"
+                              f"- {zip_path}\n"
+                              f"- {pt_path}")
         
     elif algorithm.lower() == "sac":
-        # Create environment to initialize the agent - standard 96x96 size
-        def make_env():
-            # Return a function that creates the environment when called
-            def _init():
-                env = gym.make("CarRacing-v3", continuous=True)
-                return env
-            return _init  # Return the function, not the result of calling it
-            
-        env = DummyVecEnv([make_env()])
-        env = VecFrameStack(env, n_stack=4)
-        env = VecTransposeImage(env)
-        
-        # Look for SAC PyTorch model
+        # Only look for SAC PyTorch model
         pt_path = os.path.join(model_dir, "sac_car_racing_best.pt")
         if os.path.exists(pt_path):
             print(f"Loading SAC model from {pt_path}")
             # Initialize and load the SAC agent
             agent = SAC(env=env)
             agent.load(pt_path)
-            return agent
-        
-        # Check for any alternative SAC model files - WITHOUT TRAINING NEW ONES
-        print("Warning: Could not find sac_car_racing_best.pt. Looking for alternatives...")
-        sac_files = [f for f in os.listdir(model_dir) if f.startswith("sac_") and f.endswith(".pt")]
-        
-        if sac_files:
-            print(f"Found alternative SAC model files: {sac_files}")
-            file = sac_files[0]  # Take the first one
-            print(f"Loading alternative SAC model from {file}")
-            agent = SAC(env=env)
-            agent.load(os.path.join(model_dir, file))
+            
+            # Apply the frame stacking preprocessor
+            agent.predict = create_frame_stack_preprocessor(agent.predict)
+            
             return agent
                 
         # If we get here, no suitable model was found
-        raise FileNotFoundError(f"No SAC model found in {model_dir}. Please train a model first.")
+        raise FileNotFoundError(f"SAC model file not found. Expected: {pt_path}")
     
     else:
         raise ValueError("Algorithm must be either 'ppo' or 'sac'")
