@@ -26,7 +26,7 @@ USE_HALF_PRECISION = True  # Control flag
 
 # Memory optimization for sac.py
 
-# 1. More memory-efficient buffer with dynamic growth and lower precision
+# 1. Memory-efficient buffer with dynamic growth and lower precision
 class ReplayBuffer:
     """Memory-efficient experience replay buffer with gradual growth"""
     def __init__(self, capacity, observation_shape, action_dim, device):
@@ -325,10 +325,10 @@ class SAC:
                 tau=0.005,
                 alpha=0.2,
                 auto_entropy_tuning=True,
-                buffer_size=400000,  # Reduced buffer size
-                batch_size=128,      # Increased batch size for efficiency
-                initial_random_steps=2000,  # Reduced initial exploration
-                update_every=2,      # Update less frequently
+                buffer_size=400000, 
+                batch_size=64,      
+                initial_random_steps=10000,
+                update_every=1,      
                 device="auto"):
         
         self.device = torch.device("cuda" if torch.cuda.is_available() and device == "auto" else "cpu")
@@ -514,7 +514,7 @@ class SAC:
         actor_loss.backward()
         self.actor_optimizer.step()
         
-        # Update alpha (temperature) if auto-tuning is enabled
+        # Update alpha if auto-tuning is enabled
         if self.auto_entropy_tuning:
             # Calculate alpha loss
             alpha_loss = -(self.log_alpha * (log_probs + self.target_entropy).detach()).mean()
@@ -559,7 +559,7 @@ class SAC:
         episode_length = 0
         training_start_time = time.time()
         
-        # For logging - use arrays instead of lists for memory efficiency
+        # For logging
         recent_rewards = np.zeros(10)
         recent_rewards_idx = 0
         
@@ -579,10 +579,9 @@ class SAC:
                 else:
                     action = self.select_action(obs)
                 
-                # Execute action in environment - handle both API versions
+                # Execute action in environment
                 step_result = self.env.step(action.reshape(1, -1))
                 
-                # Check if we have the new Gym API (5 return values) or old API (4 return values)
                 if len(step_result) == 5:
                     next_obs, reward, terminated, truncated, _ = step_result
                     done = terminated or truncated
@@ -784,7 +783,7 @@ class SAC:
             
         return self
 
-# Training script at the bottom for when the file is run directly
+# Training script
 if __name__ == "__main__":
     import os
     from stable_baselines3.common.vec_env import VecTransposeImage
@@ -797,7 +796,7 @@ if __name__ == "__main__":
         """Create and wrap the CarRacing environment"""
         def _init():
             env = gym.make("CarRacing-v3", continuous=True)
-            env = Monitor(env, "logs/car_racing_sac")
+            env = Monitor(env, "logs/car_racing_sac_")
             return env
         return _init
     
@@ -816,9 +815,9 @@ if __name__ == "__main__":
         tau=0.005,               # Keep default SAC value
         alpha=0.2,               # Start with default SAC value
         auto_entropy_tuning=True,# Auto-tune to match PPO's exploration
-        buffer_size=100000,      # Keep larger buffer for off-policy
+        buffer_size=400000,      # Keep larger buffer for off-policy
         batch_size=64,           # Match PPO's batch size
-        initial_random_steps=10000,  # Scale back to be more like PPO
+        initial_random_steps=10000,  
         update_every=1,          # Update every step like PPO
         device="auto"
     )
@@ -834,4 +833,4 @@ if __name__ == "__main__":
     if os.path.exists("models/sac_car_racing_best.pt"):
         print("Copying best model to standard name format...")
         import shutil
-        shutil.copy("models/sac_car_racing_best.pt", "models/sac_car_racing_best.pt")
+        shutil.copy("models/sac_car_racing_best.pt", "models/sac_car_racing_best_final.pt")

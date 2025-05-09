@@ -6,6 +6,7 @@ logs/
 *.mp4
 
 archive/*
+interface/
 comparison_results_*
 # Ignore everything in models directory
 models/*

@@ -65,7 +65,7 @@ def plot_learning_curves(output_dir="analysis_results"):
     plt.close()  # Close the plot instead of showing it (better for headless environments)
     print(f"Learning curves saved to {os.path.join(output_dir, 'learning_curves.png')}")
 
-def plot_statistical_comparison(output_dir="analysis_results"):
+def plot_statistical_comparison(output_dir="analysis_results_new"):
     """Generate statistical comparison plots between algorithms"""
     os.makedirs(output_dir, exist_ok=True)
     

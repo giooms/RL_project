@@ -35,10 +35,9 @@ def compare_algorithms(n_episodes=20, render=False, save_video=True, output_dir=
         os.makedirs(video_dir, exist_ok=True)
         
         # Create separate directories for each algorithm
-        ppo_video_dir = os.path.join(video_dir, "ppo")
-        sac_video_dir = os.path.join(video_dir, "sac")
-        os.makedirs(ppo_video_dir, exist_ok=True)
-        os.makedirs(sac_video_dir, exist_ok=True)
+        for algo in ["ppo", "sac"]:
+            algo_video_dir = os.path.join(video_dir, algo)
+            os.makedirs(algo_video_dir, exist_ok=True)
     
     # Evaluation metrics to track
     metrics = {
@@ -50,6 +49,14 @@ def compare_algorithms(n_episodes=20, render=False, save_video=True, output_dir=
     # This ensures both algorithms face identical tracks
     episode_seeds = [np.random.randint(0, 10000) for _ in range(n_episodes)]
     print(f"Using fixed seeds for track generation: {episode_seeds}")
+    
+    # Pre-load models to avoid repeated loading
+    print("Loading models...")
+    models = {
+        "ppo": load_best_agent("ppo"),
+        "sac": load_best_agent("sac")
+    }
+    print("Models loaded successfully.")
     
     for episode in range(n_episodes):
         episode_seed = episode_seeds[episode]
@@ -64,178 +71,96 @@ def compare_algorithms(n_episodes=20, render=False, save_video=True, output_dir=
         for algo in ["ppo", "sac"]:
             print(f"\nRunning {algo.upper()}...")
             
-            # Set up rendering mode
-            render_mode = "rgb_array" if save_video else ("human" if render else None)
-            
-            # For vectorized environment with proper wrappers for models
-            def make_env():
-                def _init():
-                    # Create environment with the fixed seed for this episode
-                    env = gym.make("CarRacing-v3", continuous=True, domain_randomize=False)
-                    # Set the random seed for the environment (controls track generation)
-                    env.reset(seed=episode_seed)
-                    
-                    # Add video recording if needed
-                    if save_video:
-                        current_video_dir = os.path.join(video_dir, algo)
-                        episode_video_dir = os.path.join(current_video_dir, f"episode_{episode}")
-                        os.makedirs(episode_video_dir, exist_ok=True)
-                        env = gym.wrappers.RecordVideo(
-                            env, 
-                            episode_video_dir, 
-                            episode_trigger=lambda _: True
-                        )
-                    return env
-                return _init
+            # Use the SAME approach as interface.py (which works)
+            if save_video:
+                current_video_dir = os.path.join(video_dir, algo, f"episode_{episode}")
+                os.makedirs(current_video_dir, exist_ok=True)
                 
-            env = None  # Initialize to None to prevent reference errors in finally block
+                env = gym.make("CarRacing-v3", render_mode="rgb_array", continuous=True)
+                env = gym.wrappers.RecordVideo(env, current_video_dir, episode_trigger=lambda x: True)
+                print(f"Recording video to {current_video_dir}")
+            else:
+                render_mode = "human" if render else None
+                env = gym.make("CarRacing-v3", render_mode=render_mode, continuous=True)
+            
+            # Get the pre-loaded model
+            model = models[algo]
             
             try:
-                # Create properly wrapped environment
-                env = DummyVecEnv([make_env()])
-                env = VecFrameStack(env, n_stack=4)
-                env = VecTransposeImage(env)
+                # Reset with seed for same track
+                observation, info = env.reset(seed=episode_seed)
                 
-                # Load the appropriate agent
-                model = load_best_agent(algo)
-                
-                # For SAC, add predict method fix
-                if algo == "sac":
-                    print(f"SAC model loaded. Checking action output...")
-                    # Patch the predict method to ensure proper action shape
-                    original_predict = model.predict
-                    
-                    def patched_predict(observation, deterministic=True):
-                        with torch.no_grad():
-                            action, _ = original_predict(observation, deterministic)
-                            
-                            # Ensure action is a properly shaped numpy array
-                            if isinstance(action, (float, int)) or (isinstance(action, np.ndarray) and action.shape == ()):
-                                action = np.array([action, 0.0, 0.0])  # [steer, gas, brake]
-                            elif len(action.shape) == 1 and action.shape[0] == 1:
-                                action = np.array([action[0], 0.0, 0.0])
-                                
-                            # Ensure proper shape and limits for CarRacing
-                            if action.shape != (3,):
-                                action = np.zeros(3)
-                            
-                            # Clip values to valid ranges
-                            action[0] = np.clip(action[0], -1.0, 1.0)  # Steering
-                            action[1] = np.clip(action[1], 0.0, 1.0)   # Gas
-                            action[2] = np.clip(action[2], 0.0, 1.0)   # Brake
-                                
-                        return action, None
-                    
-                    # Replace the predict method
-                    model.predict = patched_predict
-                    
-                    # Test the fix
-                    test_obs = env.reset()[0]
-                    test_action, _ = model.predict(test_obs, deterministic=True)
-                    print(f"SAC test action shape: {test_action.shape}, value: {test_action}")
-                    print(f"Environment action space: {env.action_space}")
-
-                reset_result = env.reset()
-                if isinstance(reset_result, tuple):
-                    if len(reset_result) == 2:
-                        obs, _ = reset_result
-                    else:
-                        obs = reset_result[0]
-                else:
-                    obs = reset_result
+                # Initialize episode tracking
                 done = False
                 episode_reward = 0
                 episode_length = 0
                 trajectory = []
                 
-                first_action, _ = model.predict(obs, deterministic=True)
-                print(f"First action: shape={first_action.shape}, value={first_action}")
-
+                # Run episode
                 while not done:
-                    action, _ = model.predict(obs, deterministic=True)
+                    # Get action from model
+                    action, _ = model.predict(observation, deterministic=True)
                     
-                    # FIX: Add batch dimension to actions for vectorized environment
-                    if algo == "sac" and len(action.shape) == 1:
-                        action = action.reshape(1, -1)
+                    # Take step in environment
+                    observation, reward, terminated, truncated, info = env.step(action)
                     
-                    step_result = env.step(action)
-
-                    # For vector environments (length 4 output)
-                    if len(step_result) == 4:
-                        obs, reward, done, info = step_result
-                        terminated = done  # Vector environments combine terminated and truncated into 'done'
-                        truncated = False  # No separate truncated flag, just use done
-                    # For regular gym environments (length 5 output)
-                    else:
-                        obs, reward, terminated, truncated, info = step_result
-                    
-                    # Handle vector environment outputs
-                    if isinstance(reward, np.ndarray):
-                        reward = reward[0]
-                    if isinstance(terminated, np.ndarray):
-                        terminated = terminated[0]
-                    if isinstance(truncated, np.ndarray):
-                        truncated = truncated[0]
-                    
+                    # Track metrics
                     episode_reward += reward
                     episode_length += 1
                     
-                    # Track position when possible (this will need adjustments for vector envs)
-                    if hasattr(env, 'envs'):
-                        # For VecEnv
-                        pos = None
-                        try:
-                            if hasattr(env.envs[0].unwrapped, 'car'):
-                                pos = env.envs[0].unwrapped.car.hull.position
-                                trajectory.append((float(pos[0]), float(pos[1])))
-                        except (AttributeError, IndexError):
-                            pass
+                    # Track position for trajectory
+                    try:
+                        if hasattr(env, 'unwrapped') and hasattr(env.unwrapped, 'car'):
+                            pos = env.unwrapped.car.hull.position
+                            trajectory.append((float(pos[0]), float(pos[1])))
+                    except (AttributeError, TypeError):
+                        pass
                     
+                    # Check if episode is done
                     done = terminated or truncated
                     
                     # Track reason for episode end
                     if done:
-                        if episode_length >= 2000:
-                            metrics[algo]["timeouts"] += 1
-                        elif episode_reward < -75:  # Threshold for crashes
+                        if episode_reward < 600:  # First check for crashes - lowered threshold
                             metrics[algo]["crashes"] += 1
-                        elif episode_reward > 800:  # Likely completed
+                            episode_metrics[algo]["crash"] = True
+                        elif episode_length >= 1000 and episode_reward < 800:  # Then check for actual timeouts
+                            metrics[algo]["timeouts"] += 1
+                            episode_metrics[algo]["timeout"] = True
+                        else:  # Otherwise it's a completion (either fast or timed out with high reward)
                             metrics[algo]["completions"] += 1
+                            episode_metrics[algo]["completion"] = True
                 
-                # Record episode results
+                # Record episode metrics
                 metrics[algo]["rewards"].append(episode_reward)
                 metrics[algo]["lengths"].append(episode_length)
                 if trajectory:
                     metrics[algo]["trajectories"].append(trajectory)
                 
+                episode_metrics[algo]["reward"] = episode_reward
+                episode_metrics[algo]["length"] = episode_length
+                
                 print(f"{algo.upper()} - Episode {episode+1}: Reward = {episode_reward:.2f}, Length = {episode_length}")
                 
-                # Make sure to properly close the environment at the end of each episode
-                if env is not None:
-                    env.close()
-                    
             except Exception as e:
                 print(f"Error in {algo} episode {episode}: {e}")
                 import traceback
                 traceback.print_exc()
             finally:
-                # Always close the environment to ensure videos get saved
-                if env is not None:
-                    env.close()
-                    # Give the system a moment to finish writing files
-                    import time
-                    time.sleep(1)
-        
-        # After both algorithms have run on this track, print a comparison
+                # Always close the environment
+                env.close()
+                time.sleep(1)  # Give time for video saving
+                
+        # Print episode comparison
         print(f"\n--- Episode {episode+1} Results (Seed: {episode_seed}) ---")
         print(f"PPO: Reward = {episode_metrics['ppo']['reward']:.2f}, Length = {episode_metrics['ppo']['length']}")
         print(f"SAC: Reward = {episode_metrics['sac']['reward']:.2f}, Length = {episode_metrics['sac']['length']}")
         print(f"Difference: {episode_metrics['ppo']['reward'] - episode_metrics['sac']['reward']:.2f}")
     
-    # Save metrics to CSV
+    # Save metrics and create visualizations
     for algo in metrics:
         df = pd.DataFrame({
-            'episode': range(1, n_episodes+1),
+            'episode': range(1, len(metrics[algo]['rewards'])+1),
             'reward': metrics[algo]['rewards'],
             'length': metrics[algo]['lengths']
         })
@@ -247,25 +172,28 @@ def compare_algorithms(n_episodes=20, render=False, save_video=True, output_dir=
         f.write("=== Performance Summary ===\n")
         for algo in ["ppo", "sac"]:
             rewards = metrics[algo]["rewards"]
-            summary = f"\n{algo.upper()} Statistics:\n"
-            summary += f"  Mean Reward: {np.mean(rewards):.2f} ± {np.std(rewards):.2f}\n"
-            summary += f"  Median Reward: {np.median(rewards):.2f}\n"
-            summary += f"  Min/Max Reward: {np.min(rewards):.2f} / {np.max(rewards):.2f}\n"
-            summary += f"  Mean Episode Length: {np.mean(metrics[algo]['lengths']):.2f}\n"
-            summary += f"  Timeouts: {metrics[algo]['timeouts']}/{n_episodes}\n"
-            summary += f"  Crashes: {metrics[algo]['crashes']}/{n_episodes}\n"
-            summary += f"  Track Completions: {metrics[algo]['completions']}/{n_episodes}\n"
-            
-            print(summary)
-            f.write(summary)
+            if rewards:  # Check there are results for this algorithm
+                summary = f"\n{algo.upper()} Statistics:\n"
+                summary += f"  Mean Reward: {np.mean(rewards):.2f} ± {np.std(rewards):.2f}\n"
+                summary += f"  Median Reward: {np.median(rewards):.2f}\n"
+                summary += f"  Min/Max Reward: {np.min(rewards):.2f} / {np.max(rewards):.2f}\n"
+                summary += f"  Mean Episode Length: {np.mean(metrics[algo]['lengths']):.2f}\n"
+                summary += f"  Timeouts: {metrics[algo]['timeouts']}/{len(rewards)}\n"
+                summary += f"  Crashes: {metrics[algo]['crashes']}/{len(rewards)}\n"
+                summary += f"  Track Completions: {metrics[algo]['completions']}/{len(rewards)}\n"
+                
+                print(summary)
+                f.write(summary)
     
     # Create visualizations
     create_comparison_plots(metrics, n_episodes, output_dir)
     
     return metrics
 
+# Keep the existing visualization function unchanged
 def create_comparison_plots(metrics, n_episodes, output_dir):
     """Create detailed comparison visualizations"""
+    # Existing implementation...
     import pandas as pd
     
     # Set up the plots
@@ -280,7 +208,7 @@ def create_comparison_plots(metrics, n_episodes, output_dir):
     
     # 2. Episode Rewards (Line plot for each episode)
     ax2 = fig.add_subplot(222)
-    ep_nums = range(1, n_episodes+1)
+    ep_nums = range(1, len(metrics['ppo']['rewards'])+1)
     ax2.plot(ep_nums, metrics['ppo']['rewards'], 'b-', label='PPO')
     ax2.plot(ep_nums, metrics['sac']['rewards'], 'r-', label='SAC')
     ax2.set_title('Episode Rewards')
@@ -323,7 +251,7 @@ def create_comparison_plots(metrics, n_episodes, output_dir):
         f.write("Car Racing Algorithm Comparison\n")
         f.write("===============================\n\n")
         f.write(f"Comparison run on: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Number of episodes per algorithm: {n_episodes}\n\n")
+        f.write(f"Number of episodes per algorithm: {len(metrics['ppo']['rewards'])}\n\n")
         f.write("Files in this directory:\n")
         f.write("- ppo_results.csv: Raw results for PPO algorithm\n")
         f.write("- sac_results.csv: Raw results for SAC algorithm\n")

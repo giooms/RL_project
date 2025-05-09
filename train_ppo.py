@@ -64,7 +64,6 @@ def make_env():
     def _init():
         env = gym.make("CarRacing-v3", continuous=True)
         env = Monitor(env, "logs/car_racing_ppo")
-        # NO RESIZE - keep original 96x96 size
         return env
     return _init
 

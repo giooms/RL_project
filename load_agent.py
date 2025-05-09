@@ -80,7 +80,7 @@ def load_best_agent(algorithm="ppo"):
             model.predict = create_frame_stack_preprocessor(model.predict)
             return model
         
-        # If we get here, no suitable model was found
+        # If we get here, no suitable model was found -- Should not happen
         raise FileNotFoundError(f"PPO model file not found. Expected either:\n"
                               f"- {zip_path}\n"
                               f"- {pt_path}")
@@ -99,7 +99,7 @@ def load_best_agent(algorithm="ppo"):
             
             return agent
                 
-        # If we get here, no suitable model was found
+        # If we get here, no suitable model was found -- Should not happen
         raise FileNotFoundError(f"SAC model file not found. Expected: {pt_path}")
     
     else:
